@@ -1,0 +1,1514 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:http/http.dart' as http;
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+/* ==========================
+   CONFIG
+========================== */
+
+const String pointsApiBase = "https://pay.gullapay.com.br/api";
+const String authTokenKey = "gullapay_token";
+
+// Directus (novo endpoint - preparado)
+const String directusBase = "https://cms.gullapay.com.br";
+
+final GoogleSignIn _googleSignIn = GoogleSignIn(
+  scopes: ['email'],
+  serverClientId: '31190049887-v31ju7pehu751qat5oavjia41iksh5dm.apps.googleusercontent.com',
+);
+
+// Google user storage
+const String kExternalIdKey = "external_id";
+const String kUserEmailKey = "user_email";
+const String kUserNameKey = "user_name";
+
+// Asset logo
+const String kLogoAsset = "assets/images/gulla_logo.png";
+
+/* ==========================
+   APP
+========================== */
+
+void main() => runApp(const GullaPointsApp());
+
+class GullaPointsApp extends StatelessWidget {
+  const GullaPointsApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: "Gulla Points",
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: C.bg,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+        ),
+      ),
+      home: const SplashGate(),
+    );
+  }
+}
+
+/* ==========================
+   THEME
+========================== */
+
+class C {
+  static const bg = Color(0xFF070A12);
+  static const panel = Color(0xFF0E1220);
+  static const panel2 = Color(0xFF11162A);
+  static const line = Color(0xFF1A2340);
+  static const text = Color(0xFFE9EDF7);
+  static const muted = Color(0xFFB6BED6);
+
+  static const gold = Color(0xFFF3D27A);
+  static const amber = Color(0xFFFFC94A);
+
+  static const logoBlack = Color(0xFF000000);
+}
+
+class Grad {
+  static const header = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [Color(0xFF11173A), Color(0xFF0B0F23)],
+  );
+
+  static const goldBtn = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [C.amber, C.gold],
+  );
+}
+
+/* ==========================
+   UI COMPONENTS
+========================== */
+
+class GPCard extends StatelessWidget {
+  final Widget child;
+  final EdgeInsets padding;
+  final Gradient? gradient;
+
+  const GPCard({
+    super.key,
+    required this.child,
+    this.padding = const EdgeInsets.all(16),
+    this.gradient,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        gradient: gradient,
+        color: gradient == null ? C.panel : null,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: C.line.withOpacity(.55)),
+        boxShadow: const [
+          BoxShadow(color: Colors.black38, blurRadius: 24, offset: Offset(0, 14))
+        ],
+      ),
+      padding: padding,
+      child: child,
+    );
+  }
+}
+
+class PillButton extends StatelessWidget {
+  final String label;
+  final VoidCallback? onTap;
+  final bool primary;
+
+  const PillButton({
+    super.key,
+    required this.label,
+    required this.onTap,
+    this.primary = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = primary ? Grad.goldBtn : null;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(16),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          gradient: bg,
+          color: bg == null ? C.panel2 : null,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: primary ? Colors.transparent : C.line.withOpacity(.65),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: primary ? C.amber.withOpacity(.22) : Colors.black26,
+              blurRadius: 20,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Center(
+          child: Text(
+            label,
+            style: TextStyle(
+              fontWeight: FontWeight.w900,
+              letterSpacing: .4,
+              color: primary ? const Color(0xFF1A1406) : C.text,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class LogoMark extends StatelessWidget {
+  final double size;
+  const LogoMark({super.key, this.size = 92});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: C.logoBlack,
+        borderRadius: BorderRadius.circular(size * 0.28),
+        border: Border.all(color: C.line.withOpacity(.65)),
+        boxShadow: const [
+          BoxShadow(color: Colors.black54, blurRadius: 24, offset: Offset(0, 14)),
+        ],
+      ),
+      padding: EdgeInsets.all(size * 0.16),
+      child: Image.asset(kLogoAsset, fit: BoxFit.contain),
+    );
+  }
+}
+
+PreferredSizeWidget goldAppBar(String title, {List<Widget>? actions}) {
+  return AppBar(
+    title: Text(
+      title,
+      style: const TextStyle(
+        color: C.gold,
+        fontWeight: FontWeight.w900,
+        letterSpacing: .2,
+      ),
+    ),
+    actions: actions,
+  );
+}
+
+/* ==========================
+   NODE API (SEM DIRECTUS NO APK)
+========================== */
+
+class NodeApi {
+  static Future<Map<String, dynamic>> getBalance(String externalId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString(authTokenKey);
+
+    final uri = Uri.parse('$pointsApiBase/points/balance');
+
+    final res = await http.get(uri, headers: {
+      'Authorization': 'Bearer $token',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+    });
+
+
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw Exception('Balance HTTP ${res.statusCode}: ${res.body}');
+    }
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  static Future<List<Map<String, dynamic>>> listStores({String? search}) async {
+    final qp = <String, String>{
+      '_t': DateTime.now().millisecondsSinceEpoch.toString(),
+    };
+    if (search != null && search.trim().isNotEmpty) {
+      qp['search'] = search.trim();
+    }
+
+    final uri = Uri.parse('$pointsApiBase/clube/stores').replace(queryParameters: qp);
+
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString(authTokenKey);
+
+    final res = await http.get(uri, headers: {
+      'Authorization': 'Bearer $token',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+    });
+
+
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw Exception('Stores HTTP ${res.statusCode}: ${res.body}');
+    }
+
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    return (data['data'] as List).cast<Map<String, dynamic>>();
+  }
+}
+
+/* ==========================
+   AUTH
+========================== */
+
+Future<String> signInWithGoogleAndGetExternalId() async {
+  final account = await _googleSignIn.signIn();
+  if (account == null) throw Exception("Login cancelado.");
+
+  // pega idToken do Google
+  final auth = await account.authentication;
+  final idToken = auth.idToken;
+  if (idToken == null) throw Exception("Falha ao obter idToken do Google.");
+
+  // troca idToken por JWT do seu servidor
+  final res = await http.post(
+    Uri.parse('$pointsApiBase/auth/google'),
+    headers: {'Content-Type': 'application/json'},
+    body: jsonEncode({'idToken': idToken}),
+  );
+
+  if (res.statusCode != 200) {
+    throw Exception("Erro ao autenticar no servidor (${res.statusCode})");
+  }
+
+  final data = jsonDecode(res.body);
+  final token = data['token'];
+  final user = data['user'];
+
+  final prefs = await SharedPreferences.getInstance();
+
+  // salva JWT real
+  await prefs.setString(authTokenKey, token);
+
+  // mantém seus dados locais (opcional)
+  await prefs.setString(kExternalIdKey, user['external_id']);
+  await prefs.setString(kUserEmailKey, user['email']);
+  await prefs.setString(kUserNameKey, user['name']);
+
+  return user['external_id']; // mantém compatível com o resto do app
+}
+
+Future<void> signOutGoogle() async {
+  try {
+    await _googleSignIn.signOut();
+  } catch (_) {}
+
+  final prefs = await SharedPreferences.getInstance();
+
+  await prefs.remove(authTokenKey);
+  await prefs.remove(kExternalIdKey);
+  await prefs.remove(kUserEmailKey);
+  await prefs.remove(kUserNameKey);
+  await prefs.remove('gulla_points_balance');
+}
+
+
+/* ==========================
+   SPLASH GATE
+========================== */
+
+class SplashGate extends StatefulWidget {
+  const SplashGate({super.key});
+
+  @override
+  State<SplashGate> createState() => _SplashGateState();
+}
+
+class _SplashGateState extends State<SplashGate> {
+  @override
+  void initState() {
+    super.initState();
+    _boot();
+  }
+
+  Future<void> _boot() async {
+    await Future.delayed(const Duration(milliseconds: 650));
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString(authTokenKey);
+
+    if (!mounted) return;
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => (token != null && token.isNotEmpty) ? const Shell() : const LoginScreen(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(gradient: Grad.header),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: const [
+              LogoMark(size: 96),
+              SizedBox(height: 14),
+              _BrandTitle(),
+              SizedBox(height: 18),
+              SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 3)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/* ==========================
+   BRAND TITLE
+========================== */
+
+class _BrandTitle extends StatelessWidget {
+  const _BrandTitle();
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: const [
+        Text(
+          "Gulla",
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, letterSpacing: .2),
+          textAlign: TextAlign.center,
+        ),
+        SizedBox(height: 2),
+        Text(
+          "Points",
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: C.muted, letterSpacing: .4),
+          textAlign: TextAlign.center,
+        ),
+      ],
+    );
+  }
+}
+
+/* ==========================
+   LOGIN
+========================== */
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _loginGoogle() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      await signInWithGoogleAndGetExternalId();
+      if (!mounted) return;
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (_) => const Shell()),
+        (_) => false,
+      );
+    } catch (e) {
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(gradient: Grad.header),
+        child: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 420),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const LogoMark(size: 108),
+                    const SizedBox(height: 14),
+                    const _BrandTitle(),
+                    const SizedBox(height: 18),
+                    PillButton(
+                      label: _loading ? "Aguarde..." : "ENTRAR COM GOOGLE",
+                      primary: true,
+                      onTap: _loading ? null : _loginGoogle,
+                    ),
+                    if (_error != null) ...[
+                      const SizedBox(height: 12),
+                      Text(_error!, style: const TextStyle(color: Colors.redAccent)),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/* ==========================
+   SHELL + NAV
+========================== */
+
+class Shell extends StatefulWidget {
+  const Shell({super.key});
+
+  @override
+  State<Shell> createState() => _ShellState();
+}
+
+class _ShellState extends State<Shell> {
+  int idx = 0;
+  String? clubCategory;
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      HomePoints(
+        onOpenClube: (cat) => setState(() {
+          clubCategory = cat;
+          idx = 1;
+        }),
+        onOpenScan: () => setState(() => idx = 2),
+      ),
+      GullaClubeScreen(initialCategory: clubCategory),
+      const PointsScanScreen(),
+      const ActivityScreen(),
+      ProfileScreen(
+        onLogout: () async {
+          await signOutGoogle();
+          if (!context.mounted) return;
+          Navigator.pushAndRemoveUntil(
+            context,
+            MaterialPageRoute(builder: (_) => const LoginScreen()),
+            (_) => false,
+          );
+        },
+      ),
+    ];
+
+    return Scaffold(
+      body: SafeArea(child: pages[idx]),
+      bottomNavigationBar: SafeArea(
+        top: false,
+        child: _BottomBar(
+          index: idx,
+          onChange: (v) => setState(() => idx = v),
+        ),
+      ),
+    );
+  }
+}
+
+class _BottomBar extends StatelessWidget {
+  final int index;
+  final ValueChanged<int> onChange;
+
+  const _BottomBar({required this.index, required this.onChange});
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomSafe = MediaQuery.of(context).padding.bottom;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF0A0E1B),
+        border: Border(top: BorderSide(color: C.line.withOpacity(.55))),
+      ),
+      padding: EdgeInsets.fromLTRB(10, 8, 10, 10 + bottomSafe),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _NavItem(icon: Icons.home_rounded, label: "Pontos", active: index == 0, onTap: () => onChange(0)),
+          _NavItem(icon: Icons.storefront_rounded, label: "Clube", active: index == 1, onTap: () => onChange(1)),
+          _CenterAction(active: index == 2, onTap: () => onChange(2)),
+          _NavItem(icon: Icons.bar_chart_rounded, label: "Atividade", active: index == 3, onTap: () => onChange(3)),
+          _NavItem(icon: Icons.person_rounded, label: "Perfil", active: index == 4, onTap: () => onChange(4)),
+        ],
+      ),
+    );
+  }
+}
+
+class _NavItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+
+  const _NavItem({required this.icon, required this.label, required this.active, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: active ? C.gold : C.muted),
+            const SizedBox(height: 4),
+            Text(label, style: TextStyle(fontSize: 11, color: active ? C.gold : C.muted)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CenterAction extends StatelessWidget {
+  final bool active;
+  final VoidCallback onTap;
+
+  const _CenterAction({required this.active, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(24),
+      onTap: onTap,
+      child: Container(
+        width: 54,
+        height: 54,
+        decoration: BoxDecoration(
+          color: C.logoBlack, // fundo preto
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: C.gold.withOpacity(.55), width: 1.2),
+          boxShadow: const [
+            BoxShadow(color: Colors.black54, blurRadius: 26, offset: Offset(0, 12)),
+          ],
+        ),
+        padding: const EdgeInsets.all(10),
+        child: Image.asset(kLogoAsset, fit: BoxFit.contain),
+      ),
+    );
+  }
+}
+
+/* ==========================
+   HOME
+========================== */
+
+class HomePoints extends StatefulWidget {
+  final void Function(String? category) onOpenClube;
+  final VoidCallback onOpenScan;
+  const HomePoints({super.key, required this.onOpenClube, required this.onOpenScan});
+
+  @override
+  State<HomePoints> createState() => _HomePointsState();
+}
+
+class _HomePointsState extends State<HomePoints> with WidgetsBindingObserver {
+  bool _loading = false;
+  int _balance = 0;
+  String _name = "Usuário";
+  List<String> _lastActs = [];
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_loadCachedUser());
+    unawaited(_loadBalance());
+    unawaited(_loadLastActivities());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_loadBalance());
+      unawaited(_loadLastActivities());
+    }
+  }
+
+  Future<void> _loadCachedUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    final n = prefs.getString(kUserNameKey);
+    if (n != null && n.trim().isNotEmpty) {
+      if (mounted) setState(() => _name = n.trim());
+    }
+  }
+
+  int _rewardTarget(int balance) {
+    return 50;
+  }
+
+  String _greeting() {
+    final h = DateTime.now().hour;
+    if (h < 12) return "Bom dia.";
+    if (h < 18) return "Boa tarde.";
+    return "Boa noite.";
+  }
+
+  Future<void> _loadLastActivities() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('gulla_activity') ?? '[]';
+      final list = (jsonDecode(raw) as List).map((e) => e.toString()).toList();
+      if (mounted) setState(() => _lastActs = list.take(3).toList());
+    } catch (_) {
+      if (mounted) setState(() => _lastActs = []);
+    }
+  }
+
+  Future<void> _loadBalance() async {
+    setState(() => _loading = true);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final externalId = prefs.getString(kExternalIdKey);
+
+      final cached = prefs.getInt('gulla_points_balance') ?? 0;
+      if (_balance == 0 && cached > 0) setState(() => _balance = cached);
+
+      if (externalId == null || externalId.isEmpty) return;
+
+      final data = await NodeApi.getBalance(externalId);
+      final b = int.tryParse('${data['balance'] ?? 0}') ?? 0;
+
+      await prefs.setInt('gulla_points_balance', b);
+      if (mounted) setState(() => _balance = b);
+    } catch (_) {
+      // mantém cache
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final target = _rewardTarget(_balance);
+    final missing = (target - _balance).clamp(0, 999999);
+    final progress = target == 0 ? 0.0 : (_balance / target).clamp(0.0, 1.0);
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+      children: [
+        GPCard(
+          gradient: Grad.header,
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            children: [
+              const LogoMark(size: 44),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text("Olá, $_name!", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: C.gold)),
+                    const SizedBox(height: 2),
+                    Text(_greeting(), style: const TextStyle(fontSize: 12, color: C.muted)),
+                  ],
+                ),
+              ),
+              IconButton(
+                onPressed: _loading
+                    ? null
+                    : () async {
+                        await _loadBalance();
+                        await _loadLastActivities();
+                      },
+                icon: Icon(Icons.refresh_rounded, color: _loading ? C.muted : C.gold),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(26),
+            border: Border.all(color: C.gold.withOpacity(.55), width: 1.2),
+            boxShadow: [BoxShadow(color: C.amber.withOpacity(.12), blurRadius: 28, offset: const Offset(0, 14))],
+            color: C.panel,
+          ),
+          padding: const EdgeInsets.all(18),
+          child: Column(
+            children: [
+              const Text("Seu saldo atual", style: TextStyle(color: C.gold, fontWeight: FontWeight.w900, letterSpacing: .2)),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text("$_balance", style: const TextStyle(fontSize: 44, fontWeight: FontWeight.w900)),
+                  const SizedBox(width: 8),
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 10),
+                    child: Text("GULLA", style: TextStyle(color: C.muted, fontWeight: FontWeight.w800)),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                missing > 0 ? "Faltam $missing pontos para o cupom de R\$10" : "Você já pode resgatar um cupom 🎉",
+                style: const TextStyle(color: C.muted, fontWeight: FontWeight.w700),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: LinearProgressIndicator(minHeight: 10, value: progress),
+              ),
+              const SizedBox(height: 14),
+              PillButton(label: "GANHAR PONTOS (ESCANEAR QR)", primary: true, onTap: widget.onOpenScan),
+              const SizedBox(height: 10),
+              PillButton(label: "ABRIR GULLA CLUBE", primary: false, onTap: () => widget.onOpenClube(null)),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+
+        // FILTROS CLICÁVEIS
+        GPCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("Onde usar seus pontos", style: TextStyle(fontSize: 14, fontWeight: FontWeight.w900, color: C.gold)),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  _QuickChip(icon: Icons.restaurant_rounded, label: "Restaurante", onTap: () => widget.onOpenClube("Restaurante")),
+                  _QuickChip(icon: Icons.checkroom_rounded, label: "Vestuário", onTap: () => widget.onOpenClube("Vestuário")),
+                  _QuickChip(icon: Icons.shopping_bag_rounded, label: "Calçados", onTap: () => widget.onOpenClube("Calçados")),
+                  _QuickChip(icon: Icons.home_repair_service_rounded, label: "Utilidades", onTap: () => widget.onOpenClube("Utilidades")),
+                ],
+              ),
+            ],
+          ),
+        ),
+
+        const SizedBox(height: 14),
+
+        // INDICAÇÃO
+        _ReferralCard(),
+
+        const SizedBox(height: 14),
+
+        // ÚLTIMAS ATIVIDADES
+        GPCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("Últimas atividades", style: TextStyle(fontSize: 14, fontWeight: FontWeight.w900, color: C.gold)),
+              const SizedBox(height: 10),
+              if (_lastActs.isEmpty)
+                const Text("Sem registros ainda.", style: TextStyle(color: C.muted))
+              else
+                ..._lastActs.map((t) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.bolt_rounded, color: C.gold, size: 18),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(t, style: const TextStyle(color: C.muted, fontWeight: FontWeight.w700))),
+                        ],
+                      ),
+                    )),
+              const SizedBox(height: 4),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () {},
+                  child: const Text("Ver tudo", style: TextStyle(color: C.gold, fontWeight: FontWeight.w900)),
+                ),
+              )
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _QuickChip extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  const _QuickChip({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(50),
+          onTap: onTap,
+          child: Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: C.panel2,
+              border: Border.all(color: C.gold.withOpacity(.45)),
+              boxShadow: [
+                BoxShadow(
+                  color: C.gold.withOpacity(.15),
+                  blurRadius: 14,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Icon(icon, color: C.gold, size: 26),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          label,
+          style: const TextStyle(
+            color: C.muted,
+            fontWeight: FontWeight.w800,
+            fontSize: 11,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/* ==========================
+   REFERRAL CARD
+========================== */
+
+class _ReferralCard extends StatefulWidget {
+  @override
+  State<_ReferralCard> createState() => _ReferralCardState();
+}
+
+class _ReferralCardState extends State<_ReferralCard> {
+  final _ctrl = TextEditingController(
+    text: "https://gullapay.com.br/indique?ref=SEU_CODIGO",
+  );
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendWhatsapp() async {
+    final link = _ctrl.text.trim();
+    if (link.isEmpty) return;
+
+    final text = "Baixe o GullaPoints e ganhe 10 GULLA: $link";
+    final uri = Uri.parse("https://wa.me/?text=${Uri.encodeComponent(text)}");
+
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Não consegui abrir o WhatsApp neste dispositivo.")),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GPCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text("Indique e ganhe 10 Gulla", style: TextStyle(fontSize: 14, fontWeight: FontWeight.w900, color: C.gold)),
+          const SizedBox(height: 6),
+          const Text("Compartilhe seu link. Quando a pessoa usar o app, você ganha 10 Gulla.", style: TextStyle(color: C.muted, fontSize: 12)),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _ctrl,
+            decoration: InputDecoration(
+              hintText: "Cole aqui seu link/caminho...",
+              hintStyle: const TextStyle(color: C.muted),
+              filled: true,
+              fillColor: C.panel2,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: C.line.withOpacity(.6))),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: C.line.withOpacity(.6))),
+            ),
+          ),
+          const SizedBox(height: 12),
+          PillButton(
+            label: "ENVIAR NO WHATSAPP",
+            primary: true,
+            onTap: _sendWhatsapp,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/* ==========================
+   CLUBE (NODE + SEARCH) - COM FILTRO
+========================== */
+
+class GullaClubeScreen extends StatefulWidget {
+  final String? initialCategory;
+  const GullaClubeScreen({super.key, this.initialCategory});
+
+  @override
+  State<GullaClubeScreen> createState() => _GullaClubeScreenState();
+}
+
+class _GullaClubeScreenState extends State<GullaClubeScreen> {
+  final _searchCtrl = TextEditingController();
+  List<Map<String, dynamic>> _allStores = [];
+  bool _loading = false;
+  String? _err;
+
+  String? _category;
+
+  @override
+  void initState() {
+    super.initState();
+    _category = widget.initialCategory;
+    unawaited(_load());
+    _searchCtrl.addListener(() => unawaited(_load()));
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _err = null;
+    });
+    try {
+      final list = await NodeApi.listStores(search: _searchCtrl.text);
+      if (!mounted) return;
+      setState(() {
+        _allStores = list;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _err = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filtered = (_category == null || _category!.isEmpty)
+        ? _allStores
+        : _allStores.where((s) {
+            final cat = (s['category'] ?? '').toString().toLowerCase();
+            return cat.contains(_category!.toLowerCase());
+          }).toList();
+
+    return Scaffold(
+      appBar: goldAppBar(
+        "Gulla Clube",
+        actions: [
+          IconButton(onPressed: _loading ? null : _load, icon: const Icon(Icons.refresh_rounded, color: C.gold)),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          GPCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("Empresas Parceiras", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: C.gold)),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _searchCtrl,
+                  decoration: InputDecoration(
+                    hintText: "Pesquisar por nome, cidade ou categoria...",
+                    hintStyle: const TextStyle(color: C.muted),
+                    prefixIcon: const Icon(Icons.search_rounded, color: C.gold),
+                    filled: true,
+                    fillColor: C.panel2,
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: C.line.withOpacity(.6))),
+                    enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: C.line.withOpacity(.6))),
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    _CatChip(label: "Restaurante", active: _category == "Restaurante", onTap: () => setState(() => _category = "Restaurante")),
+                    _CatChip(label: "Vestuário", active: _category == "Vestuário", onTap: () => setState(() => _category = "Vestuário")),
+                    _CatChip(label: "Calçados", active: _category == "Calçados", onTap: () => setState(() => _category = "Calçados")),
+                    _CatChip(label: "Utilidades", active: _category == "Utilidades", onTap: () => setState(() => _category = "Utilidades")),
+                    _CatChip(label: "Todos", active: _category == null, onTap: () => setState(() => _category = null)),
+                  ],
+                ),
+
+                if (_loading) ...[
+                  const SizedBox(height: 12),
+                  const LinearProgressIndicator(minHeight: 6),
+                ],
+                if (_err != null) ...[
+                  const SizedBox(height: 12),
+                  Text(_err!, style: const TextStyle(color: Colors.redAccent)),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          if (!_loading && filtered.isEmpty && _err == null)
+            const GPCard(
+              child: Column(
+                children: [
+                  Icon(Icons.storefront_rounded, size: 44, color: C.gold),
+                  SizedBox(height: 10),
+                  Text("Nenhuma empresa encontrada", style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+                  SizedBox(height: 6),
+                  Text("Use a busca ou os filtros para encontrar empresas parceiras.", textAlign: TextAlign.center, style: TextStyle(color: C.muted)),
+                ],
+              ),
+            )
+          else
+            ...filtered.map((s) => Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: GPCard(
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            gradient: Grad.goldBtn,
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: const Icon(Icons.storefront_rounded, color: Color(0xFF1A1406)),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text("${s['name'] ?? ''}", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: C.text)),
+                              const SizedBox(height: 2),
+                              Text("${s['city'] ?? ''} • ${s['category'] ?? ''}", style: const TextStyle(color: C.muted)),
+                              const SizedBox(height: 6),
+                              Text("WhatsApp: ${s['whatsapp'] ?? ''}", style: const TextStyle(color: C.gold, fontWeight: FontWeight.w800)),
+                            ],
+                          ),
+                        ),
+                        Text("#${s['id'] ?? ''}", style: const TextStyle(color: C.muted)),
+                      ],
+                    ),
+                  ),
+                )),
+        ],
+      ),
+    );
+  }
+}
+
+class _CatChip extends StatelessWidget {
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+
+  const _CatChip({required this.label, required this.active, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(999),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: active ? C.gold.withOpacity(.18) : C.panel2,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: active ? C.gold.withOpacity(.75) : C.line.withOpacity(.6)),
+        ),
+        child: Text(label, style: TextStyle(color: active ? C.gold : C.muted, fontWeight: FontWeight.w900, fontSize: 12)),
+      ),
+    );
+  }
+}
+
+/* ==========================
+   ACTIVITY
+========================== */
+
+class ActivityScreen extends StatefulWidget {
+  const ActivityScreen({super.key});
+
+  @override
+  State<ActivityScreen> createState() => _ActivityScreenState();
+}
+
+class _ActivityScreenState extends State<ActivityScreen> {
+  final _searchCtrl = TextEditingController();
+  List<String> _items = [];
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+    _searchCtrl.addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('gulla_activity') ?? '[]';
+      final list = (jsonDecode(raw) as List).map((e) => e.toString()).toList();
+      setState(() => _items = list);
+    } catch (_) {
+      setState(() => _items = []);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final q = _searchCtrl.text.trim().toLowerCase();
+    final filtered = q.isEmpty ? _items : _items.where((x) => x.toLowerCase().contains(q)).toList();
+
+    return Scaffold(
+      appBar: goldAppBar(
+        "Atividade",
+        actions: [
+          IconButton(onPressed: _loading ? null : _load, icon: const Icon(Icons.refresh_rounded, color: C.gold)),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          GPCard(
+            child: TextField(
+              controller: _searchCtrl,
+              decoration: InputDecoration(
+                hintText: "Pesquisar atividade...",
+                hintStyle: const TextStyle(color: C.muted),
+                prefixIcon: const Icon(Icons.search_rounded, color: C.gold),
+                filled: true,
+                fillColor: C.panel2,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: C.line.withOpacity(.6))),
+                enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: C.line.withOpacity(.6))),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          if (filtered.isEmpty)
+            const GPCard(
+              child: Column(
+                children: [
+                  Icon(Icons.bar_chart_rounded, size: 44, color: C.gold),
+                  SizedBox(height: 10),
+                  Text("Sem registros", style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+                  SizedBox(height: 6),
+                  Text("Quando você escanear QR ou resgatar, aparece aqui.", textAlign: TextAlign.center, style: TextStyle(color: C.muted)),
+                ],
+              ),
+            )
+          else
+            ...filtered.map((t) => Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: GPCard(child: Text(t)),
+                )),
+        ],
+      ),
+    );
+  }
+}
+
+/* ==========================
+   PROFILE
+========================== */
+
+class ProfileScreen extends StatelessWidget {
+  final Future<void> Function() onLogout;
+  const ProfileScreen({super.key, required this.onLogout});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: GPCard(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const LogoMark(size: 72),
+              const SizedBox(height: 10),
+              const Text("Perfil", style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: C.gold)),
+              const SizedBox(height: 10),
+              const Text("Gulla Points • by GullaPay", style: TextStyle(color: C.muted)),
+              const SizedBox(height: 14),
+              PillButton(label: "Sair", primary: false, onTap: () async => onLogout()),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/* ==========================
+   SCAN
+========================== */
+
+class PointsScanScreen extends StatefulWidget {
+  const PointsScanScreen({super.key});
+
+  @override
+  State<PointsScanScreen> createState() => _PointsScanScreenState();
+}
+
+class _PointsScanScreenState extends State<PointsScanScreen> with WidgetsBindingObserver {
+  late final MobileScannerController _controller;
+
+  bool _handled = false;
+  bool _loading = false;
+  String? _lastPayload;
+  String? _resultMsg;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _controller = MobileScannerController(
+      detectionSpeed: DetectionSpeed.noDuplicates,
+      facing: CameraFacing.back,
+    );
+
+    unawaited(_safeStart());
+  }
+
+  Future<void> _safeStart() async {
+    try {
+      await _controller.start();
+    } catch (_) {}
+  }
+
+  Future<void> _safeStop() async {
+    try {
+      await _controller.stop();
+    } catch (_) {}
+  }
+
+  @override
+  void deactivate() {
+    unawaited(_safeStop());
+    super.deactivate();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_safeStop());
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      unawaited(_safeStop());
+    } else if (state == AppLifecycleState.resumed) {
+      if (mounted) unawaited(_safeStart());
+    }
+  }
+
+  Future<void> _appendActivity(String text) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('gulla_activity') ?? '[]';
+    final list = (jsonDecode(raw) as List).map((e) => e.toString()).toList();
+    list.insert(0, "${DateTime.now().toIso8601String().substring(0, 19)}  •  $text");
+    await prefs.setString('gulla_activity', jsonEncode(list.take(200).toList()));
+  }
+
+  Future<void> _onPayload(String payload) async {
+    setState(() {
+      _loading = true;
+      _lastPayload = payload;
+      _resultMsg = null;
+    });
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final externalId = prefs.getString(kExternalIdKey);
+      
+
+      final uri = Uri.parse('$pointsApiBase/points/scan');
+      
+      final token = prefs.getString(authTokenKey);
+
+      final res = await http.post(
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({'payload': payload}),
+      );
+
+
+      if (!mounted) return;
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        final data = jsonDecode(res.body);
+        final msg = data['message']?.toString() ?? 'Scan confirmado!';
+        final balance = int.tryParse('${data['balance'] ?? 0}') ?? 0;
+        final pointsAdded = int.tryParse('${data['pointsAdded'] ?? 0}') ?? 0;
+
+        final storeName = (data['store']?['name'] ?? 'Loja').toString();
+        final storeId = (data['store']?['id'] ?? '').toString();
+
+        await prefs.setInt('gulla_points_balance', balance);
+        await _appendActivity("+$pointsAdded pontos • $storeName (ID $storeId)");
+        setState(() => _resultMsg = msg);
+      } else {
+        setState(() => _resultMsg = 'Não foi possível registrar (HTTP ${res.statusCode}).');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _resultMsg = 'Erro ao registrar: $e');
+    } finally {
+      if (!mounted) return;
+      setState(() => _loading = false);
+    }
+  }
+
+  void _reset() {
+    setState(() {
+      _handled = false;
+      _loading = false;
+      _lastPayload = null;
+      _resultMsg = null;
+    });
+    unawaited(_safeStart());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: goldAppBar("Escanear QR", actions: [
+        IconButton(onPressed: _reset, icon: const Icon(Icons.refresh_rounded, color: C.gold)),
+      ]),
+      body: Column(
+        children: [
+          Expanded(
+            child: ClipRRect(
+              borderRadius: const BorderRadius.only(
+                bottomLeft: Radius.circular(18),
+                bottomRight: Radius.circular(18),
+              ),
+              child: MobileScanner(
+                controller: _controller,
+                onDetect: (capture) {
+                  if (_handled) return;
+                  final barcodes = capture.barcodes;
+                  if (barcodes.isEmpty) return;
+                  final raw = barcodes.first.rawValue;
+                  if (raw == null || raw.trim().isEmpty) return;
+
+                  _handled = true;
+                  unawaited(_safeStop());
+                  unawaited(_onPayload(raw.trim()));
+                },
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+            child: GPCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Escaneie o QR do balcão', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: C.gold)),
+                  const SizedBox(height: 8),
+                  const Text('Você ganha pontos automaticamente (com limites por loja).', style: TextStyle(color: C.muted, fontSize: 12)),
+                  const SizedBox(height: 12),
+                  if (_lastPayload != null) ...[
+                    Text('QR lido: $_lastPayload', style: const TextStyle(color: C.muted, fontSize: 12)),
+                    const SizedBox(height: 8),
+                  ],
+                  if (_loading) ...[
+                    const LinearProgressIndicator(minHeight: 6),
+                    const SizedBox(height: 10),
+                  ],
+                  if (_resultMsg != null) ...[
+                    Text(_resultMsg!, style: const TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 12),
+                  ],
+
+                  // só LER QR centralizado (sem VOLTAR)
+                  Center(
+                    child: SizedBox(
+                      width: 220,
+                      child: PillButton(label: 'LER QR', primary: true, onTap: _reset),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/* ==========================
+   HELPERS
+========================== */
+
+void unawaited(Future<void> f) {}

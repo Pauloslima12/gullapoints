@@ -1,0 +1,38 @@
+name: gullapay_app
+description: "GullaPay Points App"
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  url_launcher: ^6.3.0
+  mobile_scanner: ^5.2.3
+  shared_preferences: ^2.2.3
+  google_sign_in: ^6.2.1
+  cupertino_icons: ^1.0.8
+  share_plus: ^7.2.0
+  qr_flutter: ^4.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/images/gulla_logo.png"
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: "assets/images/gulla_logo.png"
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/gulla_logo.png

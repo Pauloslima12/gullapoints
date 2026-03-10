@@ -1,0 +1,515 @@
+require("dotenv").config();
+const express = require("express");
+const helmet = require("helmet");
+const cors = require("cors");
+const Database = require("better-sqlite3");
+const crypto = require("crypto");
+const QRCode = require("qrcode");
+const fetch = require("node-fetch");
+const { OAuth2Client } = require("google-auth-library");
+const path = require("path");
+
+const DIRECTUS_URL = process.env.DIRECTUS_URL;
+const DIRECTUS_TOKEN = process.env.DIRECTUS_TOKEN;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const PORT = process.env.PORT || 3000;
+
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+/* =========================
+   Helpers Directus
+========================= */
+async function dFetch(path, { method = "GET", body } = {}) {
+  if (!DIRECTUS_URL || !DIRECTUS_TOKEN) {
+    throw new Error("DIRECTUS_URL ou DIRECTUS_TOKEN não definidos");
+  }
+
+  const url = `${DIRECTUS_URL}${path}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${DIRECTUS_TOKEN}`,
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const txt = await res.text();
+  let json = {};
+  try { json = txt ? JSON.parse(txt) : {}; } catch { json = { raw: txt }; }
+
+  if (!res.ok) {
+    throw new Error(`Directus ${res.status}: ${JSON.stringify(json)}`);
+  }
+
+  return json;
+}
+
+const nowSec = () => Math.floor(Date.now() / 1000);
+
+function parseStoreIdFromPayload(payload) {
+  if (!payload || typeof payload !== "string") return null;
+  const parts = payload.trim().split(":");
+  if (parts.length !== 3) return null;
+  if (parts[0] !== "GULLA" || parts[1] !== "STORE") return null;
+  const id = Number(parts[2]);
+  return Number.isFinite(id) ? id : null;
+}
+
+async function getOrCreateUser(externalId) {
+  const ext = (externalId || "").trim();
+  if (!ext) throw new Error("external_id ausente");
+
+  const filter = encodeURIComponent(JSON.stringify({ external_id: { _eq: ext } }));
+  const existing = await dFetch(`/items/app_users?filter=${filter}&limit=1`);
+  if (existing?.data?.length) return existing.data[0];
+
+  const created = await dFetch(`/items/app_users`, {
+    method: "POST",
+    body: { external_id: ext, points_balance: 0 },
+  });
+  return created.data;
+}
+
+async function updateUserBalance(externalId, newBalance) {
+  const filter = encodeURIComponent(JSON.stringify({ external_id: { _eq: externalId } }));
+  const existing = await dFetch(`/items/app_users?filter=${filter}&limit=1`);
+  const row = existing?.data?.[0];
+  if (!row) return;
+
+  await dFetch(`/items/app_users/${row.id}`, {
+    method: "PATCH",
+    body: { points_balance: Number(newBalance) || 0 },
+  });
+}
+
+async function getStore(storeId) {
+  const r = await dFetch(`/items/stores/${storeId}`);
+  return r.data;
+}
+
+async function getScanLimit(externalId, storeId) {
+  const filter = encodeURIComponent(JSON.stringify({
+    external_id: { _eq: externalId },
+    store_id: { _eq: storeId }
+  }));
+  const r = await dFetch(`/items/scan_limits?filter=${filter}&limit=1`);
+  return r?.data?.[0] || null;
+}
+
+async function upsertScanLimit(externalId, storeId) {
+  const row = await getScanLimit(externalId, storeId);
+  const t = nowSec();
+
+  if (!row) {
+    await dFetch(`/items/scan_limits`, {
+      method: "POST",
+      body: { external_id: externalId, store_id: storeId, last_scan_at: t }
+    });
+    return;
+  }
+
+  await dFetch(`/items/scan_limits/${row.id}`, {
+    method: "PATCH",
+    body: { last_scan_at: t }
+  });
+}
+
+async function addLedger(externalId, storeId, points) {
+  await dFetch(`/items/points_ledger`, {
+    method: "POST",
+    body: {
+      external_id: externalId,
+      store_id: storeId,
+      points: Number(points) || 0,
+      created_at: nowSec(),
+    }
+  });
+}
+
+
+
+/* =========================
+   App
+========================= */
+const app = express();
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+app.use(
+  '/.well-known',
+  express.static(path.join(__dirname, '.well-known'))
+);
+
+app.get("/", (req, res) => res.send("GullaPay Pay API OK"));
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+/* =========================
+   DEEP LINK QR (IMPORTANTE)
+========================= */
+app.get("/qr/:storeId", (req, res) => {
+  const storeId = req.params.storeId;
+
+  const payload = `GULLA:STORE:${storeId}`;
+
+  res.send(`
+    <html>
+      <head>
+        <title>GullaPoints</title>
+        <meta http-equiv="refresh" content="0; url=gullapoints://scan/${payload}" />
+      </head>
+      <body>
+        Abrindo GullaPoints...
+      </body>
+    </html>
+  `);
+});
+
+
+/* =========================
+   LOGIN GOOGLE (COMPATÍVEL APK)
+========================= */
+app.post("/api/auth/google", async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ error: "missing_idToken" });
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_CLIENT_ID
+    });
+
+    const payload = ticket.getPayload();
+    const external_id = `google:${payload.sub}`;
+
+    await getOrCreateUser(external_id);
+
+    // FORMATO QUE O APP ESPERA
+    return res.json({
+      token: external_id,
+      user: {
+        id: external_id,
+        external_id: external_id,
+        email: payload.email || "",
+        name: payload.name || ""
+      }
+    });
+
+  } catch (e) {
+    console.error("auth/google error:", e);
+    return res.status(500).json({ error: "auth_failed" });
+  }
+});
+
+/* =========================
+   BALANCE
+========================= */
+app.get("/api/points/balance", async (req, res) => {
+  try {
+    const ext = String(req.query.external_id || "").trim();
+    if (!ext) return res.status(400).json({ ok: false, error: "external_id ausente" });
+
+    await getOrCreateUser(ext);
+    const bal = await getBalance(ext);
+    return res.json({ ok: true, balance: bal.balance, history: bal.history });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+/* =========================
+   SCAN QR
+========================= */
+app.post("/api/points/scan", async (req, res) => {
+  try {
+    const { payload, external_id } = req.body || {};
+    const storeId = parseStoreIdFromPayload(payload);
+    if (!storeId) return res.status(400).json({ ok: false, error: "QR inválido" });
+
+    const ext = String(external_id || "").trim();
+    if (!ext) return res.status(400).json({ ok: false, error: "external_id ausente" });
+
+    await getOrCreateUser(ext);
+
+    const store = await getStore(storeId);
+    if (store?.active === false) {
+      return res.status(403).json({ ok: false, error: "Loja inativa" });
+    }
+
+    const points = Number(store?.points_per_scan ?? 48);
+    const cooldownHours = Number(store?.cooldown_hours ?? 24);
+
+    const limit = await getScanLimit(ext, storeId);
+    if (limit?.last_scan_at) {
+      const diffHours = (nowSec() - Number(limit.last_scan_at)) / 3600;
+      if (diffHours < cooldownHours) {
+        const waitMin = Math.ceil((cooldownHours - diffHours) * 60);
+        const bal = await getBalance(ext);
+        return res.json({
+          ok: false,
+          message: `Você já resgatou hoje. Tente novamente em ~${waitMin} min.`,
+          balance: bal.balance,
+        });
+      }
+    }
+
+    await addLedger(ext, storeId, points);
+    await upsertScanLimit(ext, storeId);
+
+    const balBefore = await getBalance(ext);
+    const newBalance = (Number(balBefore.balance) || 0) + points;
+    await updateUserBalance(ext, newBalance);
+
+    const bal = await getBalance(ext);
+    return res.json({
+      ok: true,
+      message: `+${points} GullaPoints em ${store?.name || "loja"}`,
+      pointsAdded: points,
+      balance: bal.balance,
+      store: { id: storeId, name: store?.name || "" },
+    });
+
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+/* =========================
+   STORES
+========================= */
+app.get("/api/clube/stores", async (req, res) => {
+  try {
+    const search = String(req.query.search || "").trim();
+
+    const qs = new URLSearchParams();
+    qs.set("fields", "id,name,city,category,whatsapp,active,points_per_scan,cooldown_hours");
+    qs.set("sort", "name");
+    qs.set("limit", "200");
+    qs.set("_t", String(Date.now()));
+
+    if (search) {
+      qs.set("filter[_or][0][name][_icontains]", search);
+      qs.set("filter[_or][1][city][_icontains]", search);
+      qs.set("filter[_or][2][category][_icontains]", search);
+    }
+
+    const r = await dFetch(`/items/stores?${qs.toString()}`);
+    return res.json({ ok: true, data: r.data || [] });
+
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+async function getBalance(externalId) {
+  const filter = encodeURIComponent(JSON.stringify({ external_id: { _eq: externalId } }));
+  const u = await dFetch(`/items/app_users?filter=${filter}&limit=1`);
+  const user = u?.data?.[0];
+
+  const balance = Number(user?.points_balance || 0);
+
+  const f2 = encodeURIComponent(JSON.stringify({ external_id: { _eq: externalId } }));
+  const r = await dFetch(`/items/points_ledger?filter=${f2}&limit=50&sort=-created_at`);
+  const history = r?.data || [];
+
+  return { balance, history };
+}
+// Saldo por loja (usado para recompensas)
+async function getStoreBalance(externalId, storeId) {
+  const filter = encodeURIComponent(JSON.stringify({
+    external_id: { _eq: externalId },
+    store_id: { _eq: storeId }
+  }));
+
+  const r = await dFetch(`/items/points_ledger?filter=${filter}&limit=1000`);
+  const history = r?.data || [];
+
+  return history.reduce((sum, row) => {
+    return sum + Number(row.points || 0);
+  }, 0);
+}
+
+/* =========================
+   STORE REWARDS (COM PROGRESSO)
+========================= */
+app.get("/api/stores/:id/rewards", async (req, res) => {
+  try {
+    const storeId = Number(req.params.id);
+    const external_id = String(req.query.external_id || "").trim();
+
+    if (!storeId || !external_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "Parâmetros inválidos"
+      });
+    }
+
+    // calcula saldo do usuário nessa loja
+    const balance = await getStoreBalance(external_id, storeId);
+
+    // busca recompensas ativas da loja
+    const rewardsRes = await dFetch(
+      `/items/store_rewards?filter[store_id][_eq]=${storeId}&filter[active][_eq]=true`
+    );
+
+    const rewards = rewardsRes?.data || [];
+
+    // adiciona progresso
+    const enriched = rewards.map(r => {
+      const cost = Number(r.points_cost || 0);
+
+      return {
+        id: r.id,
+        title: r.title,
+        discount_percent: r.discount_percent,
+        points_cost: cost,
+        user_points: balance,
+        points_missing: cost > balance ? cost - balance : 0,
+        can_redeem: balance >= cost
+      };
+    });
+
+    return res.json({
+      ok: true,
+      store_id: storeId,
+      store_balance: balance,
+      rewards: enriched
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: String(e.message || e)
+    });
+  }
+});
+
+/* =========================
+   REDEEM REWARD (SIMPLES, PREPARADO PARA EVOLUIR)
+========================= */
+app.post("/api/rewards/redeem", async (req, res) => {
+  try {
+    const { external_id, reward_id } = req.body || {};
+
+    if (!external_id || !reward_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "Parâmetros inválidos"
+      });
+    }
+
+    // buscar reward
+    const rewardRes = await dFetch(`/items/store_rewards/${reward_id}`);
+    const reward = rewardRes?.data;
+
+    if (!reward || reward.active === false) {
+      return res.json({
+        ok: false,
+        message: "Recompensa indisponível"
+      });
+    }
+
+    const storeId = reward.store_id;
+    const cost = Number(reward.points_cost || 0);
+
+    // calcular saldo na loja
+    const balance = await getStoreBalance(external_id, storeId);
+
+    if (balance < cost) {
+      return res.json({
+        ok: false,
+        message: "Pontos insuficientes",
+        store_balance: balance
+      });
+    }
+
+    // descontar pontos (ledger negativo)
+    await addLedger(external_id, storeId, -cost);
+
+    const newBalance = balance - cost;
+
+    return res.json({
+      ok: true,
+      message: `Resgate confirmado: ${reward.title}`,
+      discount_percent: reward.discount_percent,
+      points_used: cost,
+      store_balance: newBalance,
+      redeemed_at: nowSec()
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: String(e.message || e)
+    });
+  }
+});
+
+
+/* =========================
+   ADS
+========================= */
+app.get("/api/ads/banners", async (req, res) => {
+  try {
+    const placement = String(req.query.placement || "home").trim();
+
+    const qs = new URLSearchParams();
+    qs.set("fields", "id,title,image,link,placement,active,starts_at,ends_at");
+    qs.set("sort", "-id");
+    qs.set("limit", "50");
+    qs.set("filter[active][_eq]", "true");
+    qs.set("filter[placement][_eq]", placement);
+    qs.set("_t", String(Date.now()));
+
+    const r = await dFetch(`/items/banners?${qs.toString()}`);
+    return res.json({ ok: true, data: r.data || [] });
+
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+/* =========================
+   Invoices (SQLite local)
+========================= */
+const db = new Database("pay.db");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS invoices (
+    id TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    memo TEXT,
+    expires_at INTEGER NOT NULL,
+    payee TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL
+  );
+`);
+
+app.post("/api/invoices", (req, res) => {
+  const { token = "USDT", amount, memo = "", payee = "gulla", ttl_seconds = 900 } = req.body || {};
+  if (!amount) return res.status(400).json({ error: "amount required" });
+
+  const id = crypto.randomBytes(6).toString("hex").toUpperCase();
+  const created_at = nowSec();
+  const expires_at = created_at + Math.max(60, Math.min(86400, Number(ttl_seconds)));
+
+  db.prepare(`
+    INSERT INTO invoices (id, token, amount, memo, expires_at, payee, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+  `).run(id, token, String(amount), memo, expires_at, String(payee), created_at);
+
+  res.json({
+    id,
+    link: `https://pay.gullapay.com.br/i/${id}`,
+    status: "pending",
+    expires_at
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`pay-api running on port ${PORT}`);
+});

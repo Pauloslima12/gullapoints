@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "31190049887",
+    "project_id": "gullapoints",
+    "storage_bucket": "gullapoints.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:31190049887:android:b027bec5b79d8ddc31e7ea",
+        "android_client_info": {
+          "package_name": "com.gullapay.gullapoints"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBLwKg1pCmktLCOSq8vGz9na67JdzZA06c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
