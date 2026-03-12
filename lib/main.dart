@@ -1,15 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sign_in_with_apple/sign_in_with_apple.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /* ==========================
    CONFIG
@@ -19,8 +21,6 @@ const String pointsApiBase = "https://pay.gullapay.com.br/api";
 const String authTokenKey = "gullapay_token";
 
 const String directusBase = "https://cms.gullapay.com.br";
-
-
 
 const String kExternalIdKey = "external_id";
 const String kUserEmailKey = "user_email";
@@ -296,9 +296,7 @@ PreferredSizeWidget goldAppBar(String title, {List<Widget>? actions}) {
 
 class NodeApi {
   static Future<Map<String, dynamic>> getBalance(String externalId) async {
-    final uri = Uri.parse(
-      '$pointsApiBase/points/balance?external_id=$externalId',
-    );
+    final uri = Uri.parse('$pointsApiBase/points/balance?external_id=$externalId');
 
     final res = await http.get(uri);
 
@@ -329,9 +327,7 @@ class NodeApi {
     required int storeId,
     required String externalId,
   }) async {
-    final uri = Uri.parse(
-      '$pointsApiBase/stores/$storeId/rewards?external_id=$externalId',
-    );
+    final uri = Uri.parse('$pointsApiBase/stores/$storeId/rewards?external_id=$externalId');
 
     final res = await http.get(uri);
 
@@ -344,18 +340,57 @@ class NodeApi {
 }
 
 /* ==========================
-   AUTH
+   AUTH (Apple)
 ========================== */
 
-Future<String> signInWithAppleAndGetExternalId(String idToken) async {
+String _generateNonce([int length = 32]) {
+  const charset = '0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._';
+  final rand = Random.secure();
+  return List.generate(length, (_) => charset[rand.nextInt(charset.length)]).join();
+}
+
+String _sha256ofString(String input) {
+  final bytes = utf8.encode(input);
+  final digest = sha256.convert(bytes);
+  return digest.toString();
+}
+
+Future<String> signInWithAppleAndGetExternalId() async {
+  final rawNonce = _generateNonce();
+  final nonce = _sha256ofString(rawNonce);
+
+  final credential = await SignInWithApple.getAppleIDCredential(
+    scopes: [
+      AppleIDAuthorizationScopes.email,
+      AppleIDAuthorizationScopes.fullName,
+    ],
+    nonce: nonce,
+  );
+
+  final identityToken = credential.identityToken;
+  if (identityToken == null) throw Exception("Falha ao obter identityToken da Apple.");
+
+  final fullName = [
+    credential.givenName,
+    credential.familyName,
+  ].where((x) => (x ?? '').trim().isNotEmpty).join(' ').trim();
+
   final res = await http.post(
     Uri.parse('$pointsApiBase/auth/apple'),
     headers: {'Content-Type': 'application/json'},
-    body: jsonEncode({'idToken': idToken}),
+    body: jsonEncode({
+      // Backend vai validar depois (JWT + nonce + aud/iss)
+      'identityToken': identityToken,
+      'authorizationCode': credential.authorizationCode,
+      'rawNonce': rawNonce,
+      'userIdentifier': credential.userIdentifier,
+      'email': credential.email,
+      'fullName': fullName,
+    }),
   );
 
   if (res.statusCode != 200) {
-    throw Exception("Erro ao autenticar no servidor (${res.statusCode})");
+    throw Exception("Erro ao autenticar no servidor (${res.statusCode}): ${res.body}");
   }
 
   final data = jsonDecode(res.body);
@@ -363,18 +398,17 @@ Future<String> signInWithAppleAndGetExternalId(String idToken) async {
   final user = data['user'];
 
   final prefs = await SharedPreferences.getInstance();
-
   await prefs.setString(authTokenKey, token);
   await prefs.setString(kExternalIdKey, user['external_id']);
-  await prefs.setString(kUserEmailKey, user['email']);
-  await prefs.setString(kUserNameKey, user['name']);
+  await prefs.setString(kUserEmailKey, (user['email'] ?? credential.email ?? '').toString());
+  await prefs.setString(kUserNameKey, (user['name'] ?? (fullName.isNotEmpty ? fullName : 'Usuário')).toString());
 
   return user['external_id'];
 }
 
 Future<void> signOutAccount() async {
+  // Apple não possui "signOut" real no device; basta limpar sessão do app
   final prefs = await SharedPreferences.getInstance();
-
   await prefs.remove(authTokenKey);
   await prefs.remove(kExternalIdKey);
   await prefs.remove(kUserEmailKey);
@@ -414,7 +448,7 @@ class _SplashGateState extends State<SplashGate> with SingleTickerProviderStateM
     _boot();
   }
 
-    // referral loading removed from SplashGate (belongs to ReferralCard)
+  // referral loading removed from SplashGate (belongs to ReferralCard)
 
   @override
   void dispose() {
@@ -435,10 +469,7 @@ class _SplashGateState extends State<SplashGate> with SingleTickerProviderStateM
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(
-        builder: (_) =>
-            (token != null && token.isNotEmpty)
-                ? const Shell()
-                : const LoginScreen(),
+        builder: (_) => (token != null && token.isNotEmpty) ? const Shell() : const LoginScreen(),
       ),
     );
   }
@@ -533,8 +564,7 @@ class _LoginScreenState extends State<LoginScreen> {
     });
 
     try {
-      // TODO: integrar Sign in with Apple
-      throw Exception("Login Apple ainda não conectado ao backend");
+      await signInWithAppleAndGetExternalId();
       if (!mounted) return;
       Navigator.pushAndRemoveUntil(
         context,
@@ -805,7 +835,7 @@ class HomePoints extends StatefulWidget {
 }
 
 class _HomePointsState extends State<HomePoints> with WidgetsBindingObserver {
-  List<Map<String,dynamic>> _banners = [];
+  List<Map<String, dynamic>> _banners = [];
   bool _loading = false;
   int _balance = 0;
   String _name = "Usuário";
@@ -865,7 +895,7 @@ class _HomePointsState extends State<HomePoints> with WidgetsBindingObserver {
 
         if (mounted) {
           setState(() {
-            _banners = list.map((e) => Map<String,dynamic>.from(e)).toList();
+            _banners = list.map((e) => Map<String, dynamic>.from(e)).toList();
           });
         }
       }
@@ -1177,7 +1207,7 @@ class _HomePointsState extends State<HomePoints> with WidgetsBindingObserver {
                   onTap: () async {
                     if (link != null) {
                       final uri = Uri.parse(link);
-                      await launchUrl(uri,mode:LaunchMode.externalApplication);
+                      await launchUrl(uri, mode: LaunchMode.externalApplication);
                     }
                   },
                   child: Container(
@@ -1241,7 +1271,9 @@ class _HomePointsState extends State<HomePoints> with WidgetsBindingObserver {
                 )
               else
                 ..._lastActs.map((activity) {
-                  final act = activity is Map ? activity : {'display': activity.toString(), 'points': 0, 'store': 'Loja'};
+                  final act = activity is Map
+                      ? activity
+                      : {'display': activity.toString(), 'points': 0, 'store': 'Loja'};
                   final points = act['points'] ?? 0;
 
                   if (points == 0) return const SizedBox.shrink();
@@ -1379,6 +1411,7 @@ class _ReferralCardState extends State<_ReferralCard> {
     super.initState();
     _loadReferral();
   }
+
   String? _externalId;
   final _ctrl = TextEditingController();
 
@@ -1422,7 +1455,6 @@ class _ReferralCardState extends State<_ReferralCard> {
         );
       }
     }
-  }
   }
 
   @override
@@ -1602,8 +1634,7 @@ class _GullaClubeScreenState extends State<GullaClubeScreen> {
     final filtered = _allStores.where((s) {
       final matchesCategory = _category == null ||
           _category!.isEmpty ||
-          (s['category'] ?? '').toString().toLowerCase() ==
-              _category!.toLowerCase();
+          (s['category'] ?? '').toString().toLowerCase() == _category!.toLowerCase();
 
       final q = _searchCtrl.text.trim().toLowerCase();
       final matchesSearch = q.isEmpty ||
@@ -1720,77 +1751,79 @@ class _GullaClubeScreenState extends State<GullaClubeScreen> {
               ),
             )
           else
-            ...filtered.map((s) => Padding(
-                  padding: const EdgeInsets.only(bottom: 14),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(24),
-                    onTap: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => StoreRewardsScreen(store: s),
-                        ),
-                      );
-                    },
-                    child: GPCard(
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 56,
-                            height: 56,
-                            decoration: BoxDecoration(
-                              color: C.gold.withOpacity(.12),
-                              borderRadius: BorderRadius.circular(16),
-                              border: Border.all(color: C.gold.withOpacity(.3)),
-                            ),
-                            child: const Icon(Icons.store_rounded, color: C.gold, size: 28),
+            ...filtered.map(
+              (s) => Padding(
+                padding: const EdgeInsets.only(bottom: 14),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(24),
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => StoreRewardsScreen(store: s),
+                      ),
+                    );
+                  },
+                  child: GPCard(
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 56,
+                          height: 56,
+                          decoration: BoxDecoration(
+                            color: C.gold.withOpacity(.12),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: C.gold.withOpacity(.3)),
                           ),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  "${s['name'] ?? ''}",
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: .2,
-                                  ),
+                          child: const Icon(Icons.store_rounded, color: C.gold, size: 28),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                "${s['name'] ?? ''}",
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: .2,
                                 ),
-                                const SizedBox(height: 6),
-                                Row(
-                                  children: [
-                                    Icon(Icons.location_on_rounded, size: 14, color: C.muted),
-                                    const SizedBox(width: 4),
-                                    Expanded(
-                                      child: Text(
-                                        "${s['city'] ?? ''} • ${s['category'] ?? ''}",
-                                        style: TextStyle(
-                                          color: C.muted,
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 12,
-                                        ),
+                              ),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: [
+                                  Icon(Icons.location_on_rounded, size: 14, color: C.muted),
+                                  const SizedBox(width: 4),
+                                  Expanded(
+                                    child: Text(
+                                      "${s['city'] ?? ''} • ${s['category'] ?? ''}",
+                                      style: TextStyle(
+                                        color: C.muted,
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 12,
                                       ),
                                     ),
-                                  ],
-                                ),
-                              ],
-                            ),
+                                  ),
+                                ],
+                              ),
+                            ],
                           ),
-                          Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: C.gold.withOpacity(.1),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: const Icon(Icons.arrow_forward_ios_rounded, color: C.gold, size: 16),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: C.gold.withOpacity(.1),
+                            borderRadius: BorderRadius.circular(10),
                           ),
-                        ],
-                      ),
+                          child: const Icon(Icons.arrow_forward_ios_rounded, color: C.gold, size: 16),
+                        ),
+                      ],
                     ),
                   ),
-                )),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -1935,16 +1968,11 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
         }),
       );
 
-      print('[DEBUG REDEEM] Response status: ${res.statusCode}');
-      print('[DEBUG REDEEM] Response body: ${res.body}');
-
       if (!context.mounted) return;
       Navigator.pop(context);
 
       if (res.statusCode >= 200 && res.statusCode < 300) {
         final data = jsonDecode(res.body);
-
-        print('[DEBUG REDEEM] Response data: $data');
 
         if (data['ok'] == true || data['coupon_id'] != null) {
           if (!context.mounted) return;
@@ -1953,9 +1981,10 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
           final couponCode = (data['coupon_code'] ?? couponId).toString();
           final costPoints = int.tryParse('${data['points_used'] ?? 0}') ?? 0;
 
-          print('[DEBUG REDEEM] Navegando com couponId: $couponId');
-
-          await prefs.setInt('gulla_points_balance', int.tryParse('${data['store_balance'] ?? 0}') ?? 0);
+          await prefs.setInt(
+            'gulla_points_balance',
+            int.tryParse('${data['store_balance'] ?? 0}') ?? 0,
+          );
 
           Navigator.pushReplacement(
             context,
@@ -1963,9 +1992,9 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
               builder: (_) => CouponRedeemScreen(
                 couponId: couponId,
                 couponCode: couponCode,
-                couponLink: data['coupon_link'] ?? 'https://pay.gullapay.com.br/coupon/$couponId',
-                rewardTitle: data['reward_title'] ?? 'Recompensa',
-                discountPercent: data['discount_percent'] ?? 0,
+                couponLink: (data['coupon_link'] ?? 'https://pay.gullapay.com.br/coupon/$couponId').toString(),
+                rewardTitle: (data['reward_title'] ?? 'Recompensa').toString(),
+                discountPercent: int.tryParse('${data['discount_percent'] ?? 0}') ?? 0,
                 pointsUsed: costPoints,
               ),
             ),
@@ -2013,10 +2042,9 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
               padding: const EdgeInsets.all(18),
               children: [
                 ...((data?['rewards'] ?? []) as List).map((r) {
-                  final int cost = r['points_cost'];
-                  final int user = r['user_points'];
-                  final double progress =
-                      cost == 0 ? 0 : (user / cost).clamp(0.0, 1.0);
+                  final int cost = int.tryParse('${r['points_cost'] ?? 0}') ?? 0;
+                  final int user = int.tryParse('${r['user_points'] ?? 0}') ?? 0;
+                  final double progress = cost == 0 ? 0 : (user / cost).clamp(0.0, 1.0);
                   final bool canRedeem = progress >= 1;
 
                   return Padding(
@@ -2032,9 +2060,7 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
                               Container(
                                 padding: const EdgeInsets.all(12),
                                 decoration: BoxDecoration(
-                                  color: canRedeem
-                                      ? Colors.black.withOpacity(.15)
-                                      : C.gold.withOpacity(.12),
+                                  color: canRedeem ? Colors.black.withOpacity(.15) : C.gold.withOpacity(.12),
                                   borderRadius: BorderRadius.circular(14),
                                 ),
                                 child: Icon(
@@ -2046,7 +2072,7 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
                               const SizedBox(width: 12),
                               Expanded(
                                 child: Text(
-                                  r['title'],
+                                  (r['title'] ?? '').toString(),
                                   style: TextStyle(
                                     fontSize: 17,
                                     fontWeight: FontWeight.w900,
@@ -2099,13 +2125,9 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
                             child: Container(
                               height: 12,
                               decoration: BoxDecoration(
-                                color: canRedeem
-                                    ? Colors.black.withOpacity(.15)
-                                    : C.panel2,
+                                color: canRedeem ? Colors.black.withOpacity(.15) : C.panel2,
                                 border: Border.all(
-                                  color: canRedeem
-                                      ? Colors.black.withOpacity(.1)
-                                      : C.line.withOpacity(.3),
+                                  color: canRedeem ? Colors.black.withOpacity(.1) : C.line.withOpacity(.3),
                                 ),
                                 borderRadius: BorderRadius.circular(999),
                               ),
@@ -2120,15 +2142,9 @@ class _StoreRewardsScreenState extends State<StoreRewardsScreen> {
                           ),
                           const SizedBox(height: 18),
                           PillButton(
-                            label: canRedeem
-                                ? "RESGATAR AGORA"
-                                : "Faltam ${r['points_missing']} pontos",
+                            label: canRedeem ? "RESGATAR AGORA" : "Faltam ${(r['points_missing'] ?? '').toString()} pontos",
                             primary: canRedeem,
-                            onTap: canRedeem
-                                ? () async {
-                                    await _redeemReward(r['id'], context);
-                                  }
-                                : null,
+                            onTap: canRedeem ? () async => _redeemReward(int.tryParse('${r['id'] ?? 0}') ?? 0, context) : null,
                             icon: canRedeem ? Icons.check_circle_rounded : Icons.lock_rounded,
                           ),
                         ],
@@ -2496,7 +2512,9 @@ class _ActivityScreenState extends State<ActivityScreen> {
             )
           else
             ...filtered.map((activity) {
-              final act = activity is Map ? activity : {'display': activity.toString(), 'points': 0, 'store': 'Loja'};
+              final act = activity is Map
+                  ? activity
+                  : {'display': activity.toString(), 'points': 0, 'store': 'Loja'};
               final points = act['points'] ?? 0;
 
               if (points == 0) return const SizedBox.shrink();
@@ -2683,7 +2701,9 @@ class _PointsScanScreenState extends State<PointsScanScreen> with WidgetsBinding
 
       final now = DateTime.now();
       String twoDigits(int n) => n.toString().padLeft(2, '0');
-      final formatted = '${twoDigits(now.day)}/${twoDigits(now.month)}/${now.year} ${twoDigits(now.hour)}:${twoDigits(now.minute)}:${twoDigits(now.second)}';
+      final formatted =
+          '${twoDigits(now.day)}/${twoDigits(now.month)}/${now.year} '
+          '${twoDigits(now.hour)}:${twoDigits(now.minute)}:${twoDigits(now.second)}';
 
       list.insert(0, {
         'timestamp': now.toIso8601String(),
@@ -2731,8 +2751,6 @@ class _PointsScanScreenState extends State<PointsScanScreen> with WidgetsBinding
         final storeName = (data['store']?['name'] ?? 'Loja').toString();
 
         await prefs.setInt('gulla_points_balance', balance);
-
-        print('[DEBUG SCAN] Points: $pointsAdded, Store: $storeName');
         await _appendActivity(storeName, pointsAdded);
 
         setState(() => _resultMsg = msg);
