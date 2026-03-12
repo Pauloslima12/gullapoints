@@ -3,7 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_sign_in/google_sign_in.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -20,10 +20,7 @@ const String authTokenKey = "gullapay_token";
 
 const String directusBase = "https://cms.gullapay.com.br";
 
-final GoogleSignIn _googleSignIn = GoogleSignIn(
-  scopes: ['email'],
-  serverClientId: '31190049887-v31ju7pehu751qat5oavjia41iksh5dm.apps.googleusercontent.com',
-);
+
 
 const String kExternalIdKey = "external_id";
 const String kUserEmailKey = "user_email";
@@ -350,16 +347,9 @@ class NodeApi {
    AUTH
 ========================== */
 
-Future<String> signInWithGoogleAndGetExternalId() async {
-  final account = await _googleSignIn.signIn();
-  if (account == null) throw Exception("Login cancelado.");
-
-  final auth = await account.authentication;
-  final idToken = auth.idToken;
-  if (idToken == null) throw Exception("Falha ao obter idToken do Google.");
-
+Future<String> signInWithAppleAndGetExternalId(String idToken) async {
   final res = await http.post(
-    Uri.parse('$pointsApiBase/auth/google'),
+    Uri.parse('$pointsApiBase/auth/apple'),
     headers: {'Content-Type': 'application/json'},
     body: jsonEncode({'idToken': idToken}),
   );
@@ -382,11 +372,7 @@ Future<String> signInWithGoogleAndGetExternalId() async {
   return user['external_id'];
 }
 
-Future<void> signOutGoogle() async {
-  try {
-    await _googleSignIn.signOut();
-  } catch (_) {}
-
+Future<void> signOutAccount() async {
   final prefs = await SharedPreferences.getInstance();
 
   await prefs.remove(authTokenKey);
@@ -540,14 +526,15 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _loading = false;
   String? _error;
 
-  Future<void> _loginGoogle() async {
+  Future<void> _loginApple() async {
     setState(() {
       _loading = true;
       _error = null;
     });
 
     try {
-      await signInWithGoogleAndGetExternalId();
+      // TODO: integrar Sign in with Apple
+      throw Exception("Login Apple ainda não conectado ao backend");
       if (!mounted) return;
       Navigator.pushAndRemoveUntil(
         context,
@@ -580,9 +567,9 @@ class _LoginScreenState extends State<LoginScreen> {
                     const _BrandTitle(),
                     const SizedBox(height: 32),
                     PillButton(
-                      label: _loading ? "Aguarde..." : "ENTRAR COM GOOGLE",
+                      label: _loading ? "Aguarde..." : "ENTRAR COM APPLE",
                       primary: true,
-                      onTap: _loading ? null : _loginGoogle,
+                      onTap: _loading ? null : _loginApple,
                       icon: Icons.login_rounded,
                     ),
                     if (_error != null) ...[
@@ -642,7 +629,7 @@ class _ShellState extends State<Shell> {
       const ActivityScreen(),
       ProfileScreen(
         onLogout: () async {
-          await signOutGoogle();
+          await signOutAccount();
           if (!context.mounted) return;
           Navigator.pushAndRemoveUntil(
             context,
@@ -1422,14 +1409,20 @@ class _ReferralCardState extends State<_ReferralCard> {
     if (link.isEmpty) return;
 
     final text = "Baixe o GullaPoints e ganhe 10 GULLA ao entrar no Gulla Clube: $link";
-    final uri = Uri.parse("https://wa.me/?text=${Uri.encodeComponent(text)}");
 
-    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (!ok && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Não consegui abrir o WhatsApp neste dispositivo.")),
+    try {
+      await Share.share(
+        text,
+        subject: "Convite GullaPoints",
       );
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Não consegui abrir o compartilhamento neste dispositivo.")),
+        );
+      }
     }
+  }
   }
 
   @override
